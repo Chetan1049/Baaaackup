@@ -65,7 +65,7 @@ def get_dynamic_selector(driver, action=None, params=None, data_name=None):
     """
 
     if action == 'type':
-        text = params.get('text', '').lower()
+        text = (params.get('text') or params.get('value', '')).lower()
         js_script = js_base + """
         var elements = document.querySelectorAll('input, textarea');
         for (var el of elements) {
@@ -77,9 +77,9 @@ def get_dynamic_selector(driver, action=None, params=None, data_name=None):
             }
         }
         return null;
-        """ % (text, 'search' if 'search' in text else text.split()[0])
+        """ % (text, 'search' if 'search' in text else text.split()[0] if text else '')
     elif action == 'click':
-        text = params.get('text', '').lower()
+        text = (params.get('text') or params.get('value', '')).lower()
         js_script = js_base + """
         var elements = document.querySelectorAll('button, a, [role="button"]');
         for (var el of elements) {
@@ -181,7 +181,6 @@ def generate_automation_instructions(command):
 
         Only return the JSON object, nothing else.
         """
-
         response = model.generate_content(prompt)
         response_text = response.text
         if "```json" in response_text:
@@ -244,10 +243,10 @@ def generate_extraction_plan(command):
         logger.error(f"Error generating extraction plan: {str(e)}")
         raise
 
-### Execute Browser Automation
+### Execute Browser Automation (Modified)
 def execute_browser_automation(instructions, browser_type='chrome'):
     """
-    Execute automation steps using Selenium with dynamic selector fallback.
+    Execute automation steps using Selenium, prioritizing dynamic selectors over Gemini-generated ones.
     
     Args:
         instructions (dict): Automation steps from Gemini API
@@ -284,54 +283,71 @@ def execute_browser_automation(instructions, browser_type='chrome'):
                     step_result["details"] = f"Navigated to {params['url']}"
 
                 elif action == 'click':
-                    selectors = [s.strip() for s in params['selector'].split(',')]
                     element = None
-                    selector_used = params['selector']
-                    for selector in selectors:
-                        try:
-                            element = WebDriverWait(driver, 5).until(
-                                EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
-                            )
-                            break
-                        except TimeoutException:
-                            continue
-                    if not element:
-                        dynamic_selector = get_dynamic_selector(driver, 'click', params)
-                        if dynamic_selector:
-                            element = WebDriverWait(driver, 5).until(
-                                EC.element_to_be_clickable((By.CSS_SELECTOR, dynamic_selector))
-                            )
+                    selector_used = None
+                    index = params.get('index', 0)
+
+                    # Step 1: Try dynamic selector first
+                    dynamic_selector = get_dynamic_selector(driver, 'click', params)
+                    if dynamic_selector:
+                        elements = driver.find_elements(By.CSS_SELECTOR, dynamic_selector)
+                        if elements and index < len(elements):
+                            element = elements[index]
                             selector_used = dynamic_selector
+
+                    # Step 2: If dynamic fails or no element at index, fall back to Gemini selector
+                    if not element:
+                        selector = params['selector']
+                        elements = driver.find_elements(By.CSS_SELECTOR, selector)
+                        if elements and index < len(elements):
+                            element = elements[index]
+                            selector_used = selector
                         else:
-                            raise Exception("No clickable element found")
+                            raise Exception(f"No elements found with Gemini selector: {selector} or dynamic selector: {dynamic_selector}")
+
                     element.click()
-                    step_result["details"] = f"Clicked element with selector: {selector_used}"
+                    step_result["details"] = f"Clicked element {index} with selector: {selector_used}"
 
                 elif action == 'type':
-                    selectors = [s.strip() for s in params['selector'].split(',')]
-                    text = params['text']
                     element = None
-                    selector_used = params['selector']
-                    for selector in selectors:
+                    selector_used = None
+                    text = params.get('text') or params.get('value')
+                    if text is None:
+                        raise Exception("Missing 'text' or 'value' for type action")
+
+                    # Step 1: Try dynamic selector first
+                    dynamic_selector = get_dynamic_selector(driver, 'type', params)
+                    if dynamic_selector:
                         try:
-                            element = WebDriverWait(driver, 5).until(
-                                EC.visibility_of_element_located((By.CSS_SELECTOR, selector))
-                            )
-                            break
-                        except TimeoutException:
-                            continue
-                    if not element:
-                        dynamic_selector = get_dynamic_selector(driver, 'type', params)
-                        if dynamic_selector:
                             element = WebDriverWait(driver, 5).until(
                                 EC.visibility_of_element_located((By.CSS_SELECTOR, dynamic_selector))
                             )
                             selector_used = dynamic_selector
-                        else:
-                            raise Exception("No input element found")
-                    element.clear()
-                    element.send_keys(text)
-                    step_result["details"] = f"Typed '{text}' into element with selector: {selector_used}"
+                        except TimeoutException:
+                            pass
+
+                    # Step 2: If dynamic fails, fall back to Gemini selector
+                    if not element:
+                        selectors = [s.strip() for s in params['selector'].split(',')]
+                        for selector in selectors:
+                            try:
+                                element = WebDriverWait(driver, 5).until(
+                                    EC.visibility_of_element_located((By.CSS_SELECTOR, selector))
+                                )
+                                selector_used = selector
+                                break
+                            except TimeoutException:
+                                continue
+                        if not element:
+                            raise Exception(f"No input element found with Gemini selectors: {params['selector']} or dynamic selector: {dynamic_selector}")
+
+                    if text == "\n":
+                        element.send_keys(Keys.RETURN)
+                        step_result["details"] = f"Pressed Enter in element with selector: {selector_used}"
+                    else:
+                        element.clear()
+                        element.send_keys(text)
+                        step_result["details"] = f"Typed '{text}' into element with selector: {selector_used}"
                     if params.get('press_enter', False):
                         element.send_keys(Keys.RETURN)
                         WebDriverWait(driver, 20).until(
